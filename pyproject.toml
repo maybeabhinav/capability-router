@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capability-router"
+dynamic = ["version"]
+description = "Expose many MCP tools and agent skills through one MCP tool."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/maybeabhinav/capability-router"
+Issues = "https://github.com/maybeabhinav/capability-router/issues"
+
+[project.scripts]
+capability-router = "capability_router.cli:main"
+capability-router-env = "capability_router.local_launcher:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "capability_router.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["capability_router*"]

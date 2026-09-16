@@ -1,0 +1,29 @@
+{
+  "mode": "read-only",
+  "catalog_path": "catalog.json",
+  "artifact_dir": "artifacts",
+  "output_limit_bytes": 12000,
+  "call_timeout_seconds": 30,
+  "input_limit_bytes": 1048576,
+  "skill_roots": [
+    {"name": "agents", "path": "~/.agents/skills"},
+    {"name": "claude", "path": "~/.claude/skills"},
+    {"name": "codex", "path": "~/.codex/skills"}
+  ],
+  "servers": {
+    "example": {
+      "transport": "stdio",
+      "command": "example-mcp-server",
+      "args": [],
+      "cwd": ".",
+      "inherit_environment": ["PATH"],
+      "environment_from_parent": {
+        "EXAMPLE_API_TOKEN": "EXAMPLE_API_TOKEN"
+      },
+      "default_access": "unknown",
+      "access_overrides": {
+        "search": "read"
+      }
+    }
+  }
+}
