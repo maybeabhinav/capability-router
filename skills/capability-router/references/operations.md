@@ -16,9 +16,17 @@ Use `stdio` for a local child process. Use `http` for a remote Streamable
 HTTP endpoint. HTTP authentication headers map to environment variable names
 through `headers_from_parent`.
 
-The built-in HTTP transport does not perform interactive OAuth login. Keep an
-OAuth-managed server in its native client until the router has a tested token
-source for that server.
+The built-in HTTP transport does not perform interactive OAuth login. Use a
+pinned local OAuth bridge when the provider requires browser login. Configure
+the bridge as a stdio server. Use an absolute executable path.
+
+Give each context its own private OAuth store. Pass the store path through a
+context environment file with mode `0600`. Keep the store directory at mode
+`0700`. Do not copy tokens between contexts.
+
+The first discovery or call can open a browser. Complete login once for each
+service and context. Then refresh the context configuration so the authenticated
+tools enter the catalog. Run `context doctor` and call one read operation.
 
 ## Create a context
 
