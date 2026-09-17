@@ -2,12 +2,12 @@
 
 ## Local contract suite
 
-The release suite has 111 public-interface tests. It covers catalog discovery,
+The release suite has 112 public-interface tests. It covers catalog discovery,
 schema validation, policy denial, process cleanup, output limits, context
 revisions, session switching, environment isolation, and stdio and HTTP
 transports.
 
-The source distribution runs the same 111 tests after extraction.
+The source distribution runs the same 112 tests after extraction.
 
 ## Concurrent session check
 
@@ -19,11 +19,9 @@ tool.
 | --- | ---: |
 | Successful sessions | 23 of 23 |
 | Read tool calls | 23 |
-| Wall time | 0.743 s |
-| Mean session latency | 0.578 s |
-| p95 session latency | 0.701 s |
-| Maximum sampled router RSS | 12,348 KiB |
-| Combined sampled router RSS | 146,024 KiB |
+| Wall time | 0.782 s |
+| Mean session latency | 0.588 s |
+| p95 session latency | 0.737 s |
 | Leaked downstream processes | 0 |
 
 This check proves local session isolation and process cleanup. It does not

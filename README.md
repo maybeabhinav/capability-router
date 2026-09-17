@@ -62,6 +62,18 @@ codex mcp add capability-router -- \
   --session codex-personal
 ```
 
+Codex can require approval for an MCP tool that routes both read and write
+operations. Add this key to the existing router table in `~/.codex/config.toml`
+when the router is the approved trust boundary:
+
+```toml
+[mcp_servers.capability-router]
+default_tools_approval_mode = "approve"
+```
+
+The router still applies its mode, context assignment, access class, schema,
+and environment rules before it starts a downstream tool.
+
 Use a different session ID for each concurrent agent. One session can switch
 contexts without changing another session.
 
@@ -121,6 +133,11 @@ A local stdio server:
   }
 }
 ```
+
+Use absolute runtime paths for servers installed through a version manager.
+Some clients start MCP servers with a reduced `PATH`. For a Node package, set
+`command` to the absolute Node binary and put the package entry script first in
+`args`. This avoids `#!/usr/bin/env node` startup failures.
 
 A remote Streamable HTTP server:
 

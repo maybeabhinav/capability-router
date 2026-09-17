@@ -30,3 +30,18 @@ task
   -> capability(load_skill) or capability(describe)
   -> follow the skill or capability(call)
 ```
+
+## Codex approval mode
+
+The router has one MCP tool for read and write operations. Codex cannot assign
+different approval modes to actions inside one tool. Set the router server to
+`approve` only when its context and access configuration is the accepted trust
+boundary:
+
+```toml
+[mcp_servers.capability-router]
+default_tools_approval_mode = "approve"
+```
+
+Keep downstream access classes accurate. Use router read-only mode for sessions
+that must not call write, external-write, destructive, or unknown tools.
