@@ -1,134 +1,190 @@
 # Capability Router
 
-Capability Router gives an agent one MCP tool named `capability`. The agent can
-search a local catalog, load one skill, inspect one MCP tool, and call only the
-selected tool.
+Capability Router exposes skills and MCP tools through one MCP tool named
+`capability`. The model receives one stable schema. It searches for a
+capability only when the task needs it.
 
-This reduces the tool schemas and skill text placed in every model request.
-The router uses only the Python standard library at runtime.
+The router supports independent personal, office, and project contexts. Each
+agent session can select its own context. Many sessions can use the same
+registry at the same time.
+
+The runtime uses the Python standard library.
 
 ## Install
 
-Requires Python 3.10 or newer on Linux or macOS. Windows users can run it in
-WSL.
-
-With `pipx`:
+Capability Router requires Python 3.10 or newer on Linux or macOS.
 
 ```sh
 pipx install git+https://github.com/maybeabhinav/capability-router.git
 ```
 
-With `uv`:
+You can also use `uv`:
 
 ```sh
 uv tool install git+https://github.com/maybeabhinav/capability-router.git
 ```
 
-Create a safe starter configuration:
+Create and refresh a read-only configuration:
 
 ```sh
 capability-router init
 capability-router refresh --config ~/.config/capability-router/config.json
 ```
 
-The starter configuration is read-only. It discovers skills from the common
-Claude Code, Codex, and agent skill directories. Missing directories are
-ignored.
+## Connect one context
 
-## Connect an agent
+Create a context and select it for a unique session ID:
 
-Claude Code:
+```sh
+capability-router context create personal \
+  --config ~/.config/capability-router/personal/config.json \
+  --source personal \
+  --source shared
+
+capability-router context use personal --session codex-personal
+```
+
+Connect Claude Code:
 
 ```sh
 claude mcp add --scope user capability-router -- \
-  capability-router serve --config ~/.config/capability-router/config.json
+  capability-router serve \
+  --registry ~/.config/capability-router/contexts.json \
+  --session claude-personal
 ```
 
-Codex:
+Connect Codex:
 
 ```sh
 codex mcp add capability-router -- \
-  capability-router serve --config ~/.config/capability-router/config.json
+  capability-router serve \
+  --registry ~/.config/capability-router/contexts.json \
+  --session codex-personal
 ```
 
-For Codex, let the router tool run without a second approval prompt. The router
-still applies its own access policy:
+Use a different session ID for each concurrent agent. One session can switch
+contexts without changing another session.
 
-```toml
-[mcp_servers.capability-router]
-default_tools_approval_mode = "approve"
-```
+See [Context management](docs/contexts.md) for context and account commands.
 
-Add the short rule from [Agent adoption](https://github.com/maybeabhinav/capability-router/blob/main/docs/agent-adoption.md) to your agent
-instructions. Start a fresh agent process after changing MCP configuration.
+## Agent flow
 
-## How an agent uses it
+The MCP server exposes one tool. Its common actions are:
 
-The public MCP surface has one tool and five actions:
+1. `search` returns a small metadata result.
+2. `load_skill` loads one selected skill.
+3. `describe` returns one selected MCP tool schema.
+4. `call` validates and invokes one selected MCP tool.
+5. `context_current`, `context_list`, and `context_use` manage the
+   current agent session.
+6. `context_move`, `context_share`, `context_unassign`, and
+   `context_undo` change capability assignments.
 
-1. `search` finds a small set of matching skills or MCP tools.
-2. `load_skill` returns the selected `SKILL.md`.
-3. `describe` returns the selected MCP tool schema and access class.
-4. `call` validates arguments and invokes that MCP tool once.
-5. `status` reports catalog state.
+Search for one need per call. Use a result limit from 1 through 5.
 
-Search returns metadata only. It does not load a skill. Agents should search
-for one need per call and use a result limit from 1 through 5.
+The reusable agent skill is in
+[skills/capability-router/SKILL.md](skills/capability-router/SKILL.md).
 
 ## Add skills
 
-Pass one or more skill directories during setup:
+Pass one or more skill roots during setup:
 
 ```sh
 capability-router init --force \
   --skill-root personal=~/.agents/skills \
-  --skill-root team=~/work/agent-skills
+  --skill-root shared=~/agent-skills
 ```
 
-Each direct child directory can contain one `SKILL.md` file. Run `refresh`
-after a skill changes. Then restart the client or reconnect its MCP server.
-An active router process keeps the catalog that it loaded at startup.
+Each direct child can contain one `SKILL.md`. Refresh the catalog after a
+skill changes.
 
 ## Add MCP servers
 
-Edit `~/.config/capability-router/config.json`. Add local `stdio` servers under
-`servers`. See the [configuration example](https://github.com/maybeabhinav/capability-router/blob/main/examples/config.json).
+Add a server to the context configuration. Then refresh that configuration and
+run `context doctor`.
 
-Classify each tool with `default_access` or `access_overrides`:
-
-- `read`
-- `write`
-- `external_write`
-- `destructive`
-- `unknown`
-
-In `read-only` mode, the router blocks every class except `read` before it
-starts the downstream server. Use `unrestricted` mode only when the agent's
-normal approval and authority rules permit writes.
-
-The router passes only explicitly allowlisted environment variables to child
-servers. Keep credential values outside the configuration file.
-
-## Private environment files
-
-`capability-router-env` can load a JSON environment file before it starts the
-router. The file must use mode `0600`.
-
-```sh
-capability-router-env \
-  --env-file ~/.config/capability-router/private-env.json \
-  serve --config ~/.config/capability-router/config.json
-```
-
-Example private file:
+A local stdio server:
 
 ```json
 {
-  "EXAMPLE_API_TOKEN": "value-stored-outside-git"
+  "transport": "stdio",
+  "command": "example-mcp-server",
+  "args": [],
+  "cwd": ".",
+  "inherit_environment": ["PATH"],
+  "environment_from_parent": {
+    "EXAMPLE_API_TOKEN": "EXAMPLE_API_TOKEN"
+  },
+  "default_access": "unknown",
+  "access_overrides": {
+    "search": "read"
+  }
 }
 ```
 
-## Development
+A remote Streamable HTTP server:
+
+```json
+{
+  "transport": "http",
+  "url": "https://mcp.example.com/mcp",
+  "headers_from_parent": {
+    "Authorization": "EXAMPLE_AUTHORIZATION"
+  },
+  "default_access": "unknown",
+  "access_overrides": {
+    "search": "read"
+  }
+}
+```
+
+HTTP redirects are rejected. Remote URLs must use HTTPS. Loopback HTTP is
+allowed for local development.
+
+The current HTTP client supports JSON responses and SSE response frames. It
+supports tokens supplied through private environment files. Interactive OAuth
+login is not implemented yet.
+
+## Private context environments
+
+Keep values outside repository files. Create a JSON file with mode `0600`:
+
+```json
+{
+  "EXAMPLE_API_TOKEN": "value",
+  "GH_CONFIG_DIR": "/home/user/.config/gh-personal",
+  "AWS_PROFILE": "personal"
+}
+```
+
+Attach the file when you create the context:
+
+```sh
+capability-router context create personal \
+  --config ~/.config/capability-router/personal/config.json \
+  --environment-file ~/.config/capability-router/personal/environment.json
+```
+
+The router passes only variables named by a server configuration. A context
+switch replaces the environment overlay for later calls.
+
+Run a CLI with the same context:
+
+```sh
+capability-router context exec personal -- gh auth status
+capability-router context exec office -- aws sts get-caller-identity
+```
+
+## Access classes
+
+Classify each tool as `read`, `write`, `external_write`, `destructive`,
+or `unknown`.
+
+Read-only mode blocks every class except `read` before the downstream server
+starts. Use unrestricted mode only when the calling agent has authority for
+the requested operation.
+
+## Verify
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -136,17 +192,19 @@ python3 tests/verify_sdist.py
 python3 -m compileall -q capability_router tests
 ```
 
-The contract tests start local fixture MCP servers. They do not need network
-access or external accounts.
+The tests use local fixtures. They do not need external accounts.
 
-## Current scope
+See [Evaluation](docs/evaluation.md) for concurrency and agent behavior results.
 
-- Local `stdio` MCP servers
+## Scope
+
+- Local stdio MCP servers
+- Remote MCP Streamable HTTP servers with caller-supplied headers
 - Local `SKILL.md` directories
+- Per-session context selection
+- Atomic context assignment revisions and undo
+- Context-specific environment files
 - MCP protocol versions `2024-11-05`, `2025-06-18`, and `2025-11-25`
-- JSON Schema validation for the supported subset tested in this repository
-
-Remote HTTP MCP transport is outside the current scope.
 
 ## License
 

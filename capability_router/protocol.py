@@ -15,6 +15,14 @@ class RouterAction(WireValue):
     LOAD_SKILL = "load_skill"
     CALL = "call"
     STATUS = "status"
+    CONTEXT_LIST = "context_list"
+    CONTEXT_CURRENT = "context_current"
+    CONTEXT_USE = "context_use"
+    CONTEXT_EXPLAIN = "context_explain"
+    CONTEXT_MOVE = "context_move"
+    CONTEXT_UNDO = "context_undo"
+    CONTEXT_SHARE = "context_share"
+    CONTEXT_UNASSIGN = "context_unassign"
 
 
 class CapabilityKind(WireValue):
@@ -72,6 +80,39 @@ ACTION_FIELDS = {
         frozenset(),
     ),
     RouterAction.STATUS: (frozenset({"action"}), frozenset()),
+    RouterAction.CONTEXT_LIST: (frozenset({"action"}), frozenset()),
+    RouterAction.CONTEXT_CURRENT: (frozenset({"action"}), frozenset()),
+    RouterAction.CONTEXT_USE: (
+        frozenset({"action", "context"}),
+        frozenset(),
+    ),
+    RouterAction.CONTEXT_EXPLAIN: (
+        frozenset({"action", "capability_id", "context"}),
+        frozenset(),
+    ),
+    RouterAction.CONTEXT_MOVE: (
+        frozenset(
+            {
+                "action",
+                "capability_id",
+                "source_context",
+                "target_context",
+            }
+        ),
+        frozenset({"expected_revision"}),
+    ),
+    RouterAction.CONTEXT_UNDO: (
+        frozenset({"action", "change_id"}),
+        frozenset(),
+    ),
+    RouterAction.CONTEXT_SHARE: (
+        frozenset({"action", "capability_id", "target_context"}),
+        frozenset({"expected_revision"}),
+    ),
+    RouterAction.CONTEXT_UNASSIGN: (
+        frozenset({"action", "capability_id", "context"}),
+        frozenset({"expected_revision"}),
+    ),
 }
 TOOL_ARGUMENT_FIELDS = frozenset().union(
     *(required | optional for required, optional in ACTION_FIELDS.values())

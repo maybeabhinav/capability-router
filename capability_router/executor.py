@@ -11,7 +11,7 @@ import uuid
 
 from .catalog import search, tool_supported
 from .config import AccessLevel, Config, RouterMode
-from .downstream import StdioClient
+from .downstream import HttpClient, StdioClient, downstream_client
 from .errors import ErrorCode, InputError, RouterError
 from .protocol import (
     ACTION_FIELDS,
@@ -79,6 +79,22 @@ def _validate_kinds(arguments: dict[str, Any]) -> None:
             raise InputError("kinds must contain unique known values")
 
 
+def _validate_context_fields(arguments: dict[str, Any]) -> None:
+    for field in ("context", "source_context", "target_context", "change_id"):
+        if field in arguments and not (
+            isinstance(arguments[field], str) and arguments[field]
+        ):
+            raise InputError(f"{field} must be a non-empty string")
+    if "expected_revision" in arguments:
+        revision = arguments["expected_revision"]
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+        ):
+            raise InputError("expected_revision must be a non-negative integer")
+
+
 def _validate_limit(arguments: dict[str, Any]) -> None:
     if "limit" in arguments:
         limit = arguments["limit"]
@@ -98,6 +114,7 @@ ACTION_VALIDATORS = (
     _validate_capability_id,
     _validate_call_arguments,
     _validate_kinds,
+    _validate_context_fields,
     _validate_limit,
 )
 
@@ -136,7 +153,7 @@ class Executor:
         self.catalog = catalog
         self.run_id = run_id
         self.audit_path = audit_path
-        self.active_clients: set[StdioClient] = set()
+        self.active_clients: set[StdioClient | HttpClient] = set()
         self.active_clients_lock = threading.Lock()
         self.shutting_down = threading.Event()
 
@@ -153,7 +170,7 @@ class Executor:
         known = any(item.get("id") == value for item in self.catalog["capabilities"])
         return value if known else None
 
-    def _register_client(self, client: StdioClient) -> None:
+    def _register_client(self, client: StdioClient | HttpClient) -> None:
         with self.active_clients_lock:
             if self.shutting_down.is_set():
                 rejected = True
@@ -220,6 +237,14 @@ class Executor:
             RouterAction.LOAD_SKILL: self._load_skill,
             RouterAction.CALL: self._call,
             RouterAction.STATUS: lambda _: self._status(),
+            RouterAction.CONTEXT_LIST: self._context_unavailable,
+            RouterAction.CONTEXT_CURRENT: self._context_unavailable,
+            RouterAction.CONTEXT_USE: self._context_unavailable,
+            RouterAction.CONTEXT_EXPLAIN: self._context_unavailable,
+            RouterAction.CONTEXT_MOVE: self._context_unavailable,
+            RouterAction.CONTEXT_UNDO: self._context_unavailable,
+            RouterAction.CONTEXT_SHARE: self._context_unavailable,
+            RouterAction.CONTEXT_UNASSIGN: self._context_unavailable,
         }
         return handlers[action](arguments)
 
@@ -329,7 +354,7 @@ class Executor:
                 "arguments do not match the capability schema",
                 {"errors": validation_errors[:8]},
             )
-        client = StdioClient(self.config, server_name)
+        client = downstream_client(self.config, server_name)
         try:
             client.__enter__()
             self._register_client(client)
@@ -366,6 +391,10 @@ class Executor:
             with self.active_clients_lock:
                 self.active_clients.discard(client)
         return {"capability_id": item["id"], "downstream": downstream}
+
+    def _context_unavailable(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raise InputError("context actions require registry session mode")
+
 
     def _status(self) -> dict[str, Any]:
         return {

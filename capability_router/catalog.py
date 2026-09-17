@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from .config import AccessLevel, Config
-from .downstream import StdioClient
+from .downstream import downstream_client
 from .errors import ExecutionError, RouterError, VerificationError
 from .protocol import CapabilityAvailability, CapabilityKind, TaskSupport
 from .schema import schema_supported
@@ -190,7 +190,7 @@ def _discover_server(
     definition: dict[str, Any],
 ) -> list[dict[str, Any]]:
     deadline = time.monotonic() + config.call_timeout_seconds
-    with StdioClient(config, server_name) as client:
+    with downstream_client(config, server_name) as client:
         client.initialize(deadline=deadline)
         tools = client.list_tools(deadline=deadline)
     entries = (_tool_entry(server_name, definition, tool) for tool in tools)

@@ -5,16 +5,34 @@ from __future__ import annotations
 import argparse
 from enum import Enum
 import json
+import os
 from pathlib import Path
 import re
+import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from . import PRODUCT_NAME
 from .catalog import load_catalog, refresh_catalog
 from .config import RouterMode, load_config
+from .contexts import (
+    ContextCommand,
+    RegistryStore,
+    context_environment,
+    context_history,
+    create_context,
+    current_context,
+    doctor_contexts,
+    explain_context,
+    list_contexts,
+    move_capability,
+    select_context,
+    share_capability,
+    unassign_capability,
+    undo_change,
+)
 from .errors import ExecutionError, InputError, RouterError, VerificationError
-from .server import serve
+from .server import serve, serve_context
 from .util import atomic_create, atomic_write, canonical_bytes
 
 
@@ -22,6 +40,7 @@ EXIT_INPUT = 2
 EXIT_EXECUTION = 4
 EXIT_VERIFICATION = 5
 DEFAULT_CONFIG = "~/.config/capability-router/config.json"
+DEFAULT_REGISTRY = "~/.config/capability-router/contexts.json"
 SKILL_ROOT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 
@@ -30,6 +49,63 @@ class CliCommand(str, Enum):
     REFRESH = "refresh"
     STATUS = "status"
     SERVE = "serve"
+    CONTEXT = "context"
+
+
+def _context_parser(subcommands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    root = subcommands.add_parser(
+        CliCommand.CONTEXT.value,
+        help="manage isolated capability contexts",
+    )
+    root.add_argument("--registry", default=DEFAULT_REGISTRY)
+    commands = root.add_subparsers(dest="context_command", required=True)
+
+    command = commands.add_parser(ContextCommand.CREATE.value)
+    command.add_argument("context")
+    command.add_argument("--config", required=True)
+    command.add_argument("--source", action="append", default=[])
+    command.add_argument("--environment-file")
+
+    commands.add_parser(ContextCommand.LIST.value)
+
+    command = commands.add_parser(ContextCommand.USE.value)
+    command.add_argument("context")
+    command.add_argument("--session", required=True)
+
+    command = commands.add_parser(ContextCommand.CURRENT.value)
+    command.add_argument("--session", required=True)
+
+    command = commands.add_parser(ContextCommand.MOVE.value)
+    command.add_argument("capability")
+    command.add_argument("--from", dest="source", required=True)
+    command.add_argument("--to", dest="target", required=True)
+    command.add_argument("--expected-revision", type=int)
+
+    command = commands.add_parser(ContextCommand.EXPLAIN.value)
+    command.add_argument("capability")
+    command.add_argument("--context", required=True)
+
+    command = commands.add_parser(ContextCommand.UNDO.value)
+    command.add_argument("change_id")
+
+    command = commands.add_parser(ContextCommand.SHARE.value)
+    command.add_argument("capability")
+    command.add_argument("--to", dest="target", required=True)
+    command.add_argument("--expected-revision", type=int)
+
+    command = commands.add_parser(ContextCommand.UNASSIGN.value)
+    command.add_argument("capability")
+    command.add_argument("--context", required=True)
+    command.add_argument("--expected-revision", type=int)
+
+    command = commands.add_parser(ContextCommand.HISTORY.value)
+    command.add_argument("--limit", type=int, default=20)
+
+    commands.add_parser(ContextCommand.DOCTOR.value)
+
+    command = commands.add_parser(ContextCommand.EXEC.value)
+    command.add_argument("context")
+    command.add_argument("program", nargs=argparse.REMAINDER)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -56,9 +132,13 @@ def parser() -> argparse.ArgumentParser:
         command = subcommands.add_parser(name.value)
         command.add_argument("--config", required=True)
     command = subcommands.add_parser(CliCommand.SERVE.value)
-    command.add_argument("--config", required=True)
+    source = command.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config")
+    source.add_argument("--registry")
+    command.add_argument("--session")
     command.add_argument("--run-id", default="router-session")
     command.add_argument("--audit-log")
+    _context_parser(subcommands)
     return root
 
 
@@ -117,6 +197,109 @@ def initialize(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _context_exec(args: argparse.Namespace) -> int:
+    command = list(args.program)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        raise InputError("context exec requires a command")
+    environment = os.environ.copy()
+    environment.update(
+        context_environment(RegistryStore(args.registry), args.context)
+    )
+    try:
+        return subprocess.run(
+            command,
+            env=environment,
+            check=False,
+        ).returncode
+    except OSError as error:
+        raise ExecutionError("context command could not start") from error
+
+
+def _context(args: argparse.Namespace) -> dict[str, Any]:
+    store = RegistryStore(args.registry)
+    command = ContextCommand(args.context_command)
+    handlers: dict[ContextCommand, Callable[[], dict[str, Any]]] = {
+        ContextCommand.CREATE: lambda: create_context(
+            store,
+            args.context,
+            args.config,
+            args.source,
+            args.environment_file,
+        ),
+        ContextCommand.LIST: lambda: list_contexts(store),
+        ContextCommand.USE: lambda: select_context(
+            store, args.context, args.session
+        ),
+        ContextCommand.CURRENT: lambda: current_context(store, args.session),
+        ContextCommand.MOVE: lambda: move_capability(
+            store,
+            args.capability,
+            args.source,
+            args.target,
+            args.expected_revision,
+        ),
+        ContextCommand.EXPLAIN: lambda: explain_context(
+            store, args.capability, args.context
+        ),
+        ContextCommand.UNDO: lambda: undo_change(store, args.change_id),
+        ContextCommand.SHARE: lambda: share_capability(
+            store,
+            args.capability,
+            args.target,
+            args.expected_revision,
+        ),
+        ContextCommand.UNASSIGN: lambda: unassign_capability(
+            store,
+            args.capability,
+            args.context,
+            args.expected_revision,
+        ),
+        ContextCommand.HISTORY: lambda: context_history(store, args.limit),
+        ContextCommand.DOCTOR: lambda: doctor_contexts(store),
+    }
+    return handlers[command]()
+
+
+def _configured(args: argparse.Namespace, command: CliCommand) -> int:
+    config = load_config(args.config)
+    if command is CliCommand.REFRESH:
+        emit(refresh_catalog(config))
+        return 0
+    catalog, digest = load_catalog(config)
+    emit(
+        {
+            "mode": config.mode,
+            "capability_count": len(catalog["capabilities"]),
+            "catalog_sha256": digest,
+            "catalog_path": str(config.catalog_path),
+            "generated_at": catalog.get("generated_at"),
+        }
+    )
+    return 0
+
+
+def _serve(args: argparse.Namespace) -> int:
+    audit = Path(args.audit_log).expanduser().resolve() if args.audit_log else None
+    if args.registry:
+        if not args.session:
+            raise InputError("--session is required with --registry")
+        return serve_context(
+            args.registry,
+            args.session,
+            run_id=args.run_id,
+            audit_path=audit,
+        )
+    if args.session:
+        raise InputError("--session requires --registry")
+    return serve(
+        load_config(args.config),
+        run_id=args.run_id,
+        audit_path=audit,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         args = parser().parse_args(argv)
@@ -124,24 +307,14 @@ def main(argv: list[str] | None = None) -> int:
         if command is CliCommand.INIT:
             emit(initialize(args))
             return 0
-        config = load_config(args.config)
-        if command is CliCommand.REFRESH:
-            emit(refresh_catalog(config))
-        elif command is CliCommand.STATUS:
-            catalog, digest = load_catalog(config)
-            emit(
-                {
-                    "mode": config.mode,
-                    "capability_count": len(catalog["capabilities"]),
-                    "catalog_sha256": digest,
-                    "catalog_path": str(config.catalog_path),
-                    "generated_at": catalog.get("generated_at"),
-                }
-            )
-        elif command is CliCommand.SERVE:
-            audit = Path(args.audit_log).expanduser().resolve() if args.audit_log else None
-            return serve(config, run_id=args.run_id, audit_path=audit)
-        return 0
+        if command is CliCommand.CONTEXT:
+            if args.context_command == ContextCommand.EXEC.value:
+                return _context_exec(args)
+            emit(_context(args))
+            return 0
+        if command is CliCommand.SERVE:
+            return _serve(args)
+        return _configured(args, command)
     except InputError as exc:
         emit(exc.document())
         return EXIT_INPUT

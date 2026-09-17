@@ -16,6 +16,8 @@ from .catalog import load_catalog
 from .config import Config
 from .errors import ErrorCode, InputError, RouterError
 from .executor import Executor
+from .contexts import RegistryStore
+from .runtime import ContextRuntime
 from .protocol import (
     ACTION_FIELDS,
     AuditAction,
@@ -39,6 +41,11 @@ TOOL_ARGUMENT_PROPERTIES = {
     },
     "capability_id": {"type": "string", "minLength": 1},
     "arguments": {"type": "object"},
+    "context": {"type": "string", "minLength": 1},
+    "source_context": {"type": "string", "minLength": 1},
+    "target_context": {"type": "string", "minLength": 1},
+    "change_id": {"type": "string", "minLength": 1},
+    "expected_revision": {"type": "integer", "minimum": 0},
     "kinds": {
         "type": "array",
         "items": {"enum": list(CAPABILITY_KINDS)},
@@ -79,7 +86,8 @@ CAPABILITY_TOOL = {
         "Search, inspect, load, or call an optional capability. Search for one need "
         "per call with limit 1 through 5; do not combine unrelated needs. Search "
         "returns metadata only. A skill is not loaded until load_skill succeeds. "
-        "Describe an MCP tool before calling it."
+        "Describe an MCP tool before calling it. Context actions list, inspect, "
+        "switch, explain, move, share, unassign, or undo session assignments."
     ),
     "inputSchema": {
         "type": "object",
@@ -98,10 +106,23 @@ class ShutdownRequested(Exception):
 
 
 class Server:
-    def __init__(self, config: Config, *, run_id: str, audit_path: Path | None) -> None:
-        catalog, _ = load_catalog(config)
-        self.config = config
-        self.executor = Executor(config, catalog, run_id=run_id, audit_path=audit_path)
+    def __init__(
+        self,
+        config: Config,
+        *,
+        run_id: str,
+        audit_path: Path | None,
+        executor: Executor | ContextRuntime | None = None,
+    ) -> None:
+        if executor is None:
+            catalog, _ = load_catalog(config)
+            executor = Executor(
+                config,
+                catalog,
+                run_id=run_id,
+                audit_path=audit_path,
+            )
+        self.executor = executor
         self.write_lock = threading.Lock()
         self.inflight_lock = threading.Lock()
         self.inflight: set[Any] = set()
@@ -203,7 +224,7 @@ class Server:
 
     def _serve_requests(self) -> int:
         while not self.shutdown_event.is_set():
-            record = read_bounded_line(sys.stdin.buffer, self.config.input_limit_bytes)
+            record = read_bounded_line(sys.stdin.buffer, self.executor.config.input_limit_bytes)
             if record is None:
                 break
             if self.shutdown_event.is_set():
@@ -325,6 +346,10 @@ class Server:
                 RouterAction.DESCRIBE,
                 RouterAction.LOAD_SKILL,
                 RouterAction.CALL,
+                RouterAction.CONTEXT_EXPLAIN,
+                RouterAction.CONTEXT_MOVE,
+                RouterAction.CONTEXT_SHARE,
+                RouterAction.CONTEXT_UNASSIGN,
             }
             else None
         )
@@ -443,7 +468,7 @@ class Server:
         }
         if is_error:
             result["isError"] = True
-        if len(canonical_bytes(result)) <= self.config.output_limit_bytes:
+        if len(canonical_bytes(result)) <= self.executor.config.output_limit_bytes:
             return result
         try:
             metadata = self.executor.store_artifact(document)
@@ -461,11 +486,11 @@ class Server:
         }
         if is_error:
             result["isError"] = True
-        if len(canonical_bytes(result)) <= self.config.output_limit_bytes:
+        if len(canonical_bytes(result)) <= self.executor.config.output_limit_bytes:
             return result
         metadata["preview"] = ""
         result["structuredContent"] = metadata
-        if len(canonical_bytes(result)) > self.config.output_limit_bytes:
+        if len(canonical_bytes(result)) > self.executor.config.output_limit_bytes:
             return self._result_unavailable(is_error=is_error)
         return result
 
@@ -492,7 +517,7 @@ class Server:
             "content": [{"type": "text", "text": canonical_bytes(document).decode("utf-8")}],
             "structuredContent": document,
         }
-        if len(canonical_bytes(result)) <= self.config.output_limit_bytes:
+        if len(canonical_bytes(result)) <= self.executor.config.output_limit_bytes:
             return result
         error = document.get("error", {})
         compact = {
@@ -511,3 +536,24 @@ class Server:
 
 def serve(config: Config, *, run_id: str, audit_path: Path | None) -> int:
     return Server(config, run_id=run_id, audit_path=audit_path).serve()
+
+
+def serve_context(
+    registry_path: str,
+    session: str,
+    *,
+    run_id: str,
+    audit_path: Path | None,
+) -> int:
+    runtime = ContextRuntime(
+        RegistryStore(registry_path),
+        session,
+        run_id=run_id,
+        audit_path=audit_path,
+    )
+    return Server(
+        runtime.config,
+        run_id=run_id,
+        audit_path=audit_path,
+        executor=runtime,
+    ).serve()

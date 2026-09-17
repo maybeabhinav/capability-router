@@ -9,7 +9,7 @@ from tests.support import RouterTestCase
 
 EXPECTED_TOOL = {
     "name": "capability",
-    "description": "Search, inspect, load, or call an optional capability. Search for one need per call with limit 1 through 5; do not combine unrelated needs. Search returns metadata only. A skill is not loaded until load_skill succeeds. Describe an MCP tool before calling it.",
+    "description": "Search, inspect, load, or call an optional capability. Search for one need per call with limit 1 through 5; do not combine unrelated needs. Search returns metadata only. A skill is not loaded until load_skill succeeds. Describe an MCP tool before calling it. Context actions list, inspect, switch, explain, move, share, unassign, or undo session assignments.",
     "inputSchema": {
         "type": "object",
         "oneOf": [
@@ -66,6 +66,85 @@ EXPECTED_TOOL = {
                 "type": "object",
                 "required": ["action"],
                 "properties": {"action": {"const": "status"}},
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["action"],
+                "properties": {"action": {"const": "context_list"}},
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["action"],
+                "properties": {"action": {"const": "context_current"}},
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["action", "context"],
+                "properties": {
+                    "action": {"const": "context_use"},
+                    "context": {"type": "string", "minLength": 1},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["action", "capability_id", "context"],
+                "properties": {
+                    "action": {"const": "context_explain"},
+                    "capability_id": {"type": "string", "minLength": 1},
+                    "context": {"type": "string", "minLength": 1},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": [
+                    "action",
+                    "capability_id",
+                    "source_context",
+                    "target_context",
+                ],
+                "properties": {
+                    "action": {"const": "context_move"},
+                    "capability_id": {"type": "string", "minLength": 1},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "source_context": {"type": "string", "minLength": 1},
+                    "target_context": {"type": "string", "minLength": 1},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["action", "change_id"],
+                "properties": {
+                    "action": {"const": "context_undo"},
+                    "change_id": {"type": "string", "minLength": 1},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["action", "capability_id", "target_context"],
+                "properties": {
+                    "action": {"const": "context_share"},
+                    "capability_id": {"type": "string", "minLength": 1},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                    "target_context": {"type": "string", "minLength": 1},
+                },
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "required": ["action", "capability_id", "context"],
+                "properties": {
+                    "action": {"const": "context_unassign"},
+                    "capability_id": {"type": "string", "minLength": 1},
+                    "context": {"type": "string", "minLength": 1},
+                    "expected_revision": {"type": "integer", "minimum": 0},
+                },
                 "additionalProperties": False,
             },
         ]

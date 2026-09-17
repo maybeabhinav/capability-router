@@ -12,9 +12,11 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from . import PRODUCT_NAME, __version__
-from .config import Config
+from .config import Config, Transport
 from .errors import ErrorCode, ExecutionError, RouterError
 from .protocol import (
     McpMethod,
@@ -50,12 +52,21 @@ class StdioClient:
 
     def _child_environment(self) -> dict[str, str]:
         environment: dict[str, str] = {}
+        overrides = self.config.environment_overrides
+
+        def parent_value(name: str) -> str | None:
+            return overrides.get(name, os.environ.get(name))
+
         for name in self.definition["inherit_environment"]:
-            if name in os.environ:
-                environment[name] = os.environ[name]
-        for child_name, parent_name in self.definition["environment_from_parent"].items():
-            if parent_name in os.environ:
-                environment[child_name] = os.environ[parent_name]
+            value = parent_value(name)
+            if value is not None:
+                environment[name] = value
+        for child_name, parent_name in self.definition[
+            "environment_from_parent"
+        ].items():
+            value = parent_value(parent_name)
+            if value is not None:
+                environment[child_name] = value
         return environment
 
     def _resolve_command(self, environment: dict[str, str]) -> str:
@@ -507,3 +518,289 @@ class StdioClient:
             self._restore_signal_handlers()
         if self.termination_signum is not None:
             raise SystemExit(128 + self.termination_signum)
+
+
+class _NoRedirects(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        return None
+
+
+class HttpClient:
+    """Bounded MCP Streamable HTTP client."""
+
+    def __init__(self, config: Config, server_name: str) -> None:
+        self.config = config
+        self.server_name = server_name
+        self.definition = config.servers[server_name]
+        self.next_id = 1
+        self.session_id: str | None = None
+        self.protocol_version = PREFERRED_PROTOCOL_VERSION
+        self.opener = build_opener(_NoRedirects())
+
+    def __enter__(self) -> "HttpClient":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        return
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": self.protocol_version,
+        }
+        overrides = self.config.environment_overrides
+        for header, parent_name in self.definition["headers_from_parent"].items():
+            value = overrides.get(parent_name, os.environ.get(parent_name))
+            if value is not None:
+                if any(character in value for character in "\r\n\0"):
+                    raise RouterError(
+                        ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                        "downstream HTTP header value is invalid",
+                    )
+                headers[header] = value
+        if self.session_id is not None:
+            headers["Mcp-Session-Id"] = self.session_id
+        return headers
+
+    @staticmethod
+    def _sse_payload(payload: bytes) -> bytes:
+        data: list[bytes] = []
+        for line in payload.splitlines():
+            if line.startswith(b"data:"):
+                data.append(line[5:].lstrip())
+            elif not line and data:
+                break
+        if not data:
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream returned invalid event stream",
+            )
+        return b"\n".join(data)
+
+    def _post(
+        self,
+        frame: dict[str, Any],
+        *,
+        deadline: float,
+        notification: bool = False,
+    ) -> dict[str, Any] | None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RouterError(ErrorCode.TIMEOUT, "downstream call timed out")
+        request = Request(
+            self.definition["url"],
+            data=canonical_bytes(frame),
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with self.opener.open(request, timeout=remaining) as response:
+                session_id = response.headers.get("Mcp-Session-Id")
+                if session_id is not None:
+                    if not session_id or "\x00" in session_id:
+                        raise RouterError(
+                            ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                            "downstream session identifier is invalid",
+                        )
+                    self.session_id = session_id
+                payload = response.read(MAX_DOWNSTREAM_FRAME_BYTES + 1)
+                content_type = response.headers.get_content_type()
+                status = response.status
+        except HTTPError as error:
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream HTTP request failed",
+                {"status": error.code},
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            if time.monotonic() >= deadline:
+                raise RouterError(
+                    ErrorCode.TIMEOUT,
+                    "downstream call timed out",
+                ) from error
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream HTTP request failed",
+            ) from error
+        if len(payload) > MAX_DOWNSTREAM_FRAME_BYTES:
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream response exceeded the frame limit",
+            )
+        if notification and status in {202, 204}:
+            return None
+        if not payload:
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream returned an empty response",
+            )
+        raw = self._sse_payload(payload) if content_type == "text/event-stream" else payload
+        try:
+            response_document = strict_json_loads(raw)
+        except (UnicodeError, ValueError) as error:
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream returned invalid JSON",
+            ) from error
+        if (
+            not isinstance(response_document, dict)
+            or response_document.get("jsonrpc") != "2.0"
+        ):
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream returned an invalid response",
+            )
+        return response_document
+
+    def request(
+        self,
+        method: McpMethod,
+        params: dict[str, Any] | None = None,
+        *,
+        deadline: float,
+    ) -> dict[str, Any]:
+        request_id = self.next_id
+        self.next_id += 1
+        frame: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+        }
+        if params is not None:
+            frame["params"] = params
+        response = self._post(frame, deadline=deadline)
+        assert response is not None
+        response_id = response.get("id")
+        if (
+            isinstance(response_id, bool)
+            or not isinstance(response_id, int)
+            or response_id != request_id
+        ):
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream returned a mismatched response",
+            )
+        return StdioClient._response_result(response)
+
+    def initialize(self, *, deadline: float) -> None:
+        result = self.request(
+            McpMethod.INITIALIZE,
+            {
+                "protocolVersion": PREFERRED_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": PRODUCT_NAME, "version": __version__},
+            },
+            deadline=deadline,
+        )
+        server_info = result.get("serverInfo")
+        version = result.get("protocolVersion")
+        if (
+            not isinstance(version, str)
+            or version not in SUPPORTED_PROTOCOL_VERSIONS
+            or not isinstance(result.get("capabilities"), dict)
+            or not isinstance(server_info, dict)
+            or not isinstance(server_info.get("name"), str)
+            or not isinstance(server_info.get("version"), str)
+        ):
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream initialization result is invalid",
+            )
+        self.protocol_version = version
+        self._post(
+            {
+                "jsonrpc": "2.0",
+                "method": McpNotification.INITIALIZED,
+                "params": {},
+            },
+            deadline=deadline,
+            notification=True,
+        )
+
+    def list_tools(
+        self,
+        *,
+        deadline: float,
+        wanted: str | None = None,
+    ) -> list[dict[str, Any]]:
+        cursor: str | None = None
+        seen: set[str] = set()
+        found: list[dict[str, Any]] = []
+        for _ in range(100):
+            params = {} if cursor is None else {"cursor": cursor}
+            page = self.request(McpMethod.LIST_TOOLS, params, deadline=deadline)
+            tools = page.get("tools")
+            if not isinstance(tools, list) or not all(
+                isinstance(item, dict) for item in tools
+            ):
+                raise RouterError(
+                    ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                    "downstream tools/list result is invalid",
+                )
+            found.extend(tools)
+            if wanted and any(item.get("name") == wanted for item in tools):
+                return found
+            next_cursor = page.get("nextCursor")
+            if next_cursor is None:
+                return found
+            if not isinstance(next_cursor, str) or next_cursor in seen:
+                raise RouterError(
+                    ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                    "downstream pagination cursor is invalid",
+                )
+            seen.add(next_cursor)
+            cursor = next_cursor
+        raise RouterError(
+            ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+            "downstream pagination limit exceeded",
+        )
+
+    def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> dict[str, Any]:
+        result = self.request(
+            McpMethod.CALL_TOOL,
+            {"name": name, "arguments": arguments},
+            deadline=deadline,
+        )
+        if (
+            not isinstance(result.get("content"), list)
+            or ("isError" in result and not isinstance(result["isError"], bool))
+            or (
+                "structuredContent" in result
+                and not isinstance(result["structuredContent"], dict)
+            )
+        ):
+            raise RouterError(
+                ErrorCode.DOWNSTREAM_PROTOCOL_ERROR,
+                "downstream tool result is invalid",
+            )
+        return result
+
+
+def downstream_client(
+    config: Config,
+    server_name: str,
+) -> StdioClient | HttpClient:
+    transport = config.servers[server_name]["transport"]
+    clients = {
+        Transport.STDIO: StdioClient,
+        Transport.HTTP: HttpClient,
+    }
+    return clients[transport](config, server_name)

@@ -185,10 +185,18 @@ class Workspace:
 
 
 class McpSession:
-    def __init__(self, workspace: Workspace, *, run_id: str, audit_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        *,
+        run_id: str,
+        audit_path: Path | None = None,
+        serve_arguments: list[str] | None = None,
+    ) -> None:
         self.workspace = workspace
         self.run_id = run_id
         self.audit_path = workspace.audit_path if audit_path is None else audit_path
+        self.serve_arguments = serve_arguments
         self.process: subprocess.Popen[bytes] | None = None
         self._next_id = 1
         self._selector = selectors.DefaultSelector()
@@ -199,8 +207,11 @@ class McpSession:
             [
                 *CLI,
                 "serve",
-                "--config",
-                str(self.workspace.config_path),
+                *(
+                    self.serve_arguments
+                    if self.serve_arguments is not None
+                    else ["--config", str(self.workspace.config_path)]
+                ),
                 "--run-id",
                 self.run_id,
                 "--audit-log",

@@ -7,7 +7,9 @@ from enum import Enum
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from .errors import InputError
 from .util import strict_json_loads
@@ -16,6 +18,11 @@ from .util import strict_json_loads
 class RouterMode(str, Enum):
     READ_ONLY = "read-only"
     UNRESTRICTED = "unrestricted"
+
+
+class Transport(str, Enum):
+    STDIO = "stdio"
+    HTTP = "http"
 
 
 class AccessLevel(str, Enum):
@@ -46,6 +53,7 @@ class Config:
     skill_roots: tuple[dict[str, Any], ...]
     server_sources: tuple[dict[str, Any], ...]
     servers: dict[str, dict[str, Any]]
+    environment_overrides: dict[str, str]
 
 
 def _resolve(root: Path, raw: Any, field: str) -> Path:
@@ -69,18 +77,38 @@ def _normalize_servers(
         normalized[name] = _normalize_server(name, value, root)
 
 
-def _normalize_server(name: Any, value: Any, root: Path) -> dict[str, Any]:
-    if not isinstance(name, str) or not name or not isinstance(value, dict):
-        raise InputError("server names and values are invalid")
-    if value.get("transport") != "stdio":
-        raise InputError(f"server {name} uses an unsupported transport")
+def _access_fields(name: str, value: dict[str, Any]) -> dict[str, Any]:
+    default_access = value.get("default_access", AccessLevel.UNKNOWN.value)
+    overrides = value.get("access_overrides", {})
+    if not (
+        isinstance(default_access, str)
+        and default_access in ACCESS_VALUES
+        and isinstance(overrides, dict)
+        and all(
+            isinstance(tool, str)
+            and isinstance(access, str)
+            and access in ACCESS_VALUES
+            for tool, access in overrides.items()
+        )
+    ):
+        raise InputError(f"server {name} access policy is invalid")
+    return {
+        "default_access": AccessLevel(default_access),
+        "access_overrides": {
+            tool: AccessLevel(access) for tool, access in overrides.items()
+        },
+    }
 
+
+def _normalize_stdio_server(
+    name: str,
+    value: dict[str, Any],
+    root: Path,
+) -> dict[str, Any]:
     command = value.get("command")
     args = value.get("args", [])
     inherit = value.get("inherit_environment", [])
     mappings = value.get("environment_from_parent", {})
-    default_access = value.get("default_access", AccessLevel.UNKNOWN.value)
-    overrides = value.get("access_overrides", {})
     validators = (
         (isinstance(command, str) and bool(command) and "\0" not in command, "command"),
         (
@@ -101,34 +129,89 @@ def _normalize_server(name: Any, value: Any, root: Path) -> dict[str, Any]:
             ),
             "environment_from_parent",
         ),
-        (isinstance(default_access, str) and default_access in ACCESS_VALUES, "default_access"),
-        (
-            isinstance(overrides, dict)
-            and all(
-                isinstance(tool, str)
-                and isinstance(access, str)
-                and access in ACCESS_VALUES
-                for tool, access in overrides.items()
-            ),
-            "access_overrides",
-        ),
     )
     invalid = next((field for valid, field in validators if not valid), None)
     if invalid is not None:
         raise InputError(f"server {name} {invalid} is invalid")
-
     return {
-        "transport": "stdio",
+        "transport": Transport.STDIO,
         "command": command,
         "args": list(args),
         "cwd": _resolve(root, value.get("cwd", "."), f"server {name} cwd"),
         "inherit_environment": list(inherit),
         "environment_from_parent": dict(mappings),
-        "default_access": AccessLevel(default_access),
-        "access_overrides": {
-            tool: AccessLevel(access) for tool, access in overrides.items()
-        },
+        **_access_fields(name, value),
     }
+
+
+HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+RESERVED_HTTP_HEADERS = frozenset(
+    {
+        "accept",
+        "content-length",
+        "content-type",
+        "host",
+        "mcp-protocol-version",
+        "mcp-session-id",
+    }
+)
+
+
+def _normalize_http_server(
+    name: str,
+    value: dict[str, Any],
+    root: Path,
+) -> dict[str, Any]:
+    url = value.get("url")
+    headers = value.get("headers_from_parent", {})
+    if not isinstance(url, str) or not url or "\0" in url:
+        raise InputError(f"server {name} url is invalid")
+    parsed = urlsplit(url)
+    secure = parsed.scheme == "https"
+    local = parsed.scheme == "http" and parsed.hostname in LOOPBACK_HOSTS
+    if (
+        not (secure or local)
+        or not parsed.netloc
+        or parsed.username is not None
+        or bool(parsed.fragment)
+    ):
+        raise InputError(
+            f"server {name} url must use HTTPS or loopback HTTP"
+        )
+    if (
+        not isinstance(headers, dict)
+        or not all(
+            isinstance(header, str)
+            and HTTP_HEADER_NAME.fullmatch(header) is not None
+            and header.lower() not in RESERVED_HTTP_HEADERS
+            and _valid_environment_name(parent)
+            for header, parent in headers.items()
+        )
+    ):
+        raise InputError(f"server {name} headers_from_parent is invalid")
+    return {
+        "transport": Transport.HTTP,
+        "url": url,
+        "headers_from_parent": dict(headers),
+        **_access_fields(name, value),
+    }
+
+
+SERVER_NORMALIZERS = {
+    Transport.STDIO: _normalize_stdio_server,
+    Transport.HTTP: _normalize_http_server,
+}
+
+
+def _normalize_server(name: Any, value: Any, root: Path) -> dict[str, Any]:
+    if not isinstance(name, str) or not name or not isinstance(value, dict):
+        raise InputError("server names and values are invalid")
+    try:
+        transport = Transport(value.get("transport"))
+    except (TypeError, ValueError):
+        raise InputError(f"server {name} uses an unsupported transport")
+    return SERVER_NORMALIZERS[transport](name, value, root)
 
 
 def _load_json_object(path: Path, read_message: str, shape_message: str) -> dict[str, Any]:
@@ -264,4 +347,5 @@ def load_config(path: str | Path) -> Config:
         skill_roots=skill_roots,
         server_sources=server_sources,
         servers=normalized_servers,
+        environment_overrides={},
     )
