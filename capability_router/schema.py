@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from enum import Enum
 import math
 import re
 import time
@@ -10,19 +11,29 @@ from typing import Any
 from urllib.parse import unquote_to_bytes
 
 
+class SchemaDialect(str, Enum):
+    DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+    DRAFT_2020_12_FRAGMENT = "https://json-schema.org/draft/2020-12/schema#"
+    DRAFT_07 = "http://json-schema.org/draft-07/schema"
+    DRAFT_07_FRAGMENT = "http://json-schema.org/draft-07/schema#"
+
+
 TYPES = {"object", "array", "string", "integer", "number", "boolean", "null"}
 VALIDATION_LIMIT = "schema validation work limit exceeded"
 MAX_VALIDATION_ERRORS = 32
-SUPPORTED_DIALECTS = {
-    "https://json-schema.org/draft/2020-12/schema",
-    "https://json-schema.org/draft/2020-12/schema#",
-}
+SUPPORTED_DIALECTS = frozenset(dialect.value for dialect in SchemaDialect)
+DRAFT_SEVEN_DIALECTS = frozenset(
+    {
+        SchemaDialect.DRAFT_07,
+        SchemaDialect.DRAFT_07_FRAGMENT,
+    }
+)
 KNOWN_KEYWORDS = {
     "type", "properties", "required", "additionalProperties", "items", "minItems",
     "maxItems", "uniqueItems", "enum", "const", "minimum", "maximum",
     "exclusiveMinimum", "minLength", "maxLength", "pattern", "description", "title",
-    "default", "$schema", "$defs", "$ref", "anyOf", "allOf", "oneOf", "format",
-    "propertyNames",
+    "default", "$schema", "$defs", "definitions", "$ref", "anyOf", "allOf",
+    "oneOf", "format", "propertyNames",
 }
 
 
@@ -234,6 +245,23 @@ def _keyword_values_supported(schema: dict[str, Any]) -> bool:
     )
 
 
+def _schema_dialect(root: dict[str, Any]) -> SchemaDialect | None:
+    value = root.get("$schema", SchemaDialect.DRAFT_2020_12.value)
+    try:
+        return SchemaDialect(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reference_shape_supported(
+    schema: dict[str, Any], root: dict[str, Any], dialect: SchemaDialect
+) -> bool:
+    if dialect not in DRAFT_SEVEN_DIALECTS or "$ref" not in schema:
+        return True
+    allowed = {"$ref", "$schema"} if schema is root else {"$ref"}
+    return set(schema).issubset(allowed)
+
+
 def _schema_children(schema: dict[str, Any], root: dict[str, Any]) -> list[Any] | None:
     children: list[Any] = []
     if "$ref" in schema:
@@ -241,7 +269,7 @@ def _schema_children(schema: dict[str, Any], root: dict[str, Any]) -> list[Any] 
         if target is None:
             return None
         children.append(target)
-    for keyword in ("$defs", "properties"):
+    for keyword in ("$defs", "definitions", "properties"):
         if keyword in schema:
             values = schema[keyword]
             if not isinstance(values, dict):
@@ -291,6 +319,10 @@ def schema_supported(
     if budget[0] < 0:
         return False
     if not _keyword_values_supported(schema):
+        memo[memo_key] = False
+        return False
+    dialect = _schema_dialect(root)
+    if dialect is None or not _reference_shape_supported(schema, root, dialect):
         memo[memo_key] = False
         return False
     children = _schema_children(schema, root)

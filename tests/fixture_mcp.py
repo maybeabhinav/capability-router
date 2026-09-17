@@ -240,10 +240,22 @@ def tools() -> list[dict[str, Any]]:
         },
         {
             "name": "draft_seven_schema",
-            "description": "Expose a schema dialect that the router does not implement.",
+            "description": "Validate a supported JSON Schema draft-07 input.",
             "inputSchema": {
                 "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
+                "required": ["value"],
+                "properties": {"value": {"type": "string", "minLength": 1}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "draft_seven_reference_sibling",
+            "description": "Expose draft-07 reference siblings outside the supported subset.",
+            "inputSchema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "required": ["value"],
                 "properties": {
                     "source": {"type": "string"},
                     "value": {"$ref": "#/properties/source", "type": "integer"},
@@ -565,6 +577,8 @@ def call_tool(request_id: Any, params: dict[str, Any]) -> None:
         result(request_id, {"content": [{"type": "text", "text": "structured"}]})
     elif name == "wildcard_pattern":
         result(request_id, {"content": [{"type": "text", "text": "wildcard valid"}]})
+    elif name == "draft_seven_schema":
+        result(request_id, {"content": [{"type": "text", "text": "draft seven valid"}]})
     elif name in {"encoded_reference", "floating_limits"}:
         result(request_id, {"content": [{"type": "text", "text": "schema valid"}]})
     elif name in {"large_result", "large_write"}:

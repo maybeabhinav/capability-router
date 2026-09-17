@@ -204,6 +204,7 @@ See [Evaluation](docs/evaluation.md) for concurrency and agent behavior results.
 - Per-session context selection
 - Atomic context assignment revisions and undo
 - Context-specific environment files
+- Closed JSON Schema subsets for draft-07 and draft 2020-12
 - MCP protocol versions `2024-11-05`, `2025-06-18`, and `2025-11-25`
 
 ## License

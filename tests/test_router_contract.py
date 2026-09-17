@@ -632,7 +632,7 @@ class ValidationAndPolicyTests(RouterTestCase):
 
         self.assertEqual(read_json_lines(self.workspace.state / "starts.jsonl"), [])
 
-    def test_unsupported_schema_dialect_is_unavailable_before_spawn(self) -> None:
+    def test_draft_seven_schema_is_validated_and_called(self) -> None:
         self.workspace.refresh()
         self.workspace.clear_fixture_observation()
         with self.workspace.session() as session:
@@ -642,6 +642,41 @@ class ValidationAndPolicyTests(RouterTestCase):
                 {
                     "action": "call",
                     "capability_id": "fixture.draft_seven_schema",
+                    "arguments": {"value": ""},
+                },
+                "schema_validation_failed",
+            )
+            response = session.call(
+                {
+                    "action": "call",
+                    "capability_id": "fixture.draft_seven_schema",
+                    "arguments": {"value": "valid"},
+                }
+            )
+
+        self.assertFalse(response["result"].get("isError", False), response)
+        calls = read_json_lines(self.workspace.state / "calls.jsonl")
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "arguments": {"value": "valid"},
+                    "server": "fixture",
+                    "tool": "draft_seven_schema",
+                }
+            ],
+        )
+
+    def test_draft_seven_reference_siblings_are_unavailable_before_spawn(self) -> None:
+        self.workspace.refresh()
+        self.workspace.clear_fixture_observation()
+        with self.workspace.session() as session:
+            session.initialize()
+            session.assert_tool_error(
+                self,
+                {
+                    "action": "call",
+                    "capability_id": "fixture.draft_seven_reference_sibling",
                     "arguments": {"value": "valid-in-draft-seven"},
                 },
                 "unavailable",
