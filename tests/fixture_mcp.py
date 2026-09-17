@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,15 @@ from typing import Any
 STATE_DIR = Path(os.environ.get("FIXTURE_STATE_DIR", "."))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 SERVER_NAME = os.environ.get("FIXTURE_SERVER_NAME", "fixture")
+MAX_STATE_NAME_BYTES = 200
+
+
+def state_path(suffix: str) -> Path:
+    filename = f"{SERVER_NAME}.{suffix}"
+    if len(os.fsencode(filename)) > MAX_STATE_NAME_BYTES:
+        digest = hashlib.sha256(os.fsencode(SERVER_NAME)).hexdigest()
+        filename = f"server-{digest}.{suffix}"
+    return STATE_DIR / filename
 
 
 def append(name: str, value: dict[str, Any]) -> None:
@@ -23,12 +33,12 @@ def append(name: str, value: dict[str, Any]) -> None:
 
 
 def schema_mode() -> str:
-    path = STATE_DIR / f"{SERVER_NAME}.schema-mode"
+    path = state_path("schema-mode")
     return path.read_text(encoding="utf-8").strip() if path.exists() else "normal"
 
 
 def mode() -> str:
-    path = STATE_DIR / f"{SERVER_NAME}.mode"
+    path = state_path("mode")
     if path.exists():
         return path.read_text(encoding="utf-8").strip()
     return os.environ.get("FIXTURE_MODE", "normal")
