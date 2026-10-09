@@ -17,6 +17,7 @@ STATE_DIR = Path(os.environ.get("FIXTURE_STATE_DIR", "."))
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 SERVER_NAME = os.environ.get("FIXTURE_SERVER_NAME", "fixture")
 MAX_STATE_NAME_BYTES = 200
+TOOL_LIST_COUNT = 0
 
 
 def state_path(suffix: str) -> Path:
@@ -46,12 +47,19 @@ def mode() -> str:
 
 def search_schema() -> dict[str, Any]:
     maximum = 51 if schema_mode() == "changed" else 50
-    return {
+    if schema_mode() in {"incompatible", "large-incompatible"}:
+        maximum = 3
+    elif schema_mode() == "changing":
+        maximum = 50 + TOOL_LIST_COUNT
+    schema = {
         "type": "object",
         "required": ["query"],
         "properties": {"query": {"type": "string", "minLength": 1, "maxLength": maximum}},
         "additionalProperties": False,
     }
+    if schema_mode() == "large-incompatible":
+        schema["description"] = "x" * 7000
+    return schema
 
 
 def branching_schema(levels: int = 24) -> dict[str, Any]:
@@ -631,6 +639,7 @@ def call_tool(request_id: Any, params: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    global TOOL_LIST_COUNT
     append(
         "starts.jsonl",
         {
@@ -692,8 +701,14 @@ def main() -> int:
         elif method == "ping":
             result(request_id, {})
         elif method == "tools/list":
+            TOOL_LIST_COUNT += 1
+            append("lists.jsonl", {"server": SERVER_NAME})
             cursor = request.get("params", {}).get("cursor")
             all_tools = tools()
+            if mode() == "missing" or (mode() == "missing-once" and TOOL_LIST_COUNT == 1):
+                all_tools = [tool for tool in all_tools if tool["name"] != "search_messages"]
+            if mode() == "refresh-fail" and TOOL_LIST_COUNT > 1:
+                return 23
             if mode() == "task-required":
                 for tool in all_tools:
                     if tool.get("name") == "search_messages":

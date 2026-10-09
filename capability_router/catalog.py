@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
+import fcntl
 import math
+import os
 from pathlib import Path
 import re
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from .config import AccessLevel, Config
-from .downstream import downstream_client
-from .errors import ExecutionError, RouterError, VerificationError
+from .downstream import HttpClient, StdioClient, downstream_client
+from .errors import ErrorCode, ExecutionError, InputError, RouterError, VerificationError
 from .protocol import CapabilityAvailability, CapabilityKind, TaskSupport
 from .schema import schema_supported
 from .util import atomic_write, canonical_bytes, sha256_bytes, strict_json_loads, utc_now
@@ -188,11 +191,18 @@ def _discover_server(
     config: Config,
     server_name: str,
     definition: dict[str, Any],
+    *,
+    client: StdioClient | HttpClient | None = None,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
-    deadline = time.monotonic() + config.call_timeout_seconds
-    with downstream_client(config, server_name) as client:
-        client.initialize(deadline=deadline)
+    if deadline is None:
+        deadline = time.monotonic() + config.call_timeout_seconds
+    if client is not None:
         tools = client.list_tools(deadline=deadline)
+    else:
+        with downstream_client(config, server_name) as discovery_client:
+            discovery_client.initialize(deadline=deadline)
+            tools = discovery_client.list_tools(deadline=deadline)
     entries = (_tool_entry(server_name, definition, tool) for tool in tools)
     return [entry for entry in entries if entry is not None]
 
@@ -219,34 +229,101 @@ def _stale_server_entries(
     return preserved_entries
 
 
-def refresh_catalog(config: Config) -> dict[str, Any]:
-    old: dict[str, Any] = {"capabilities": []}
-    if config.catalog_path.exists():
+@contextmanager
+def _refresh_lock(config: Config, deadline: float) -> Iterator[None]:
+    lock_path = config.catalog_path.with_name(f"{config.catalog_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with lock_path.open("a+b") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        while True:
+            if time.monotonic() >= deadline:
+                raise RouterError(ErrorCode.TIMEOUT, "catalog refresh lock timed out")
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
         try:
-            old, _ = load_catalog(config)
-        except VerificationError:
-            old = {"capabilities": []}
-    entries = _skill_entries(config)
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def refresh_catalog(
+    config: Config,
+    *,
+    server_name: str | None = None,
+    client: StdioClient | HttpClient | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    """Refresh all sources, or one server using an optional initialized client."""
+    if server_name is not None and server_name not in config.servers:
+        raise InputError("refresh server is not configured")
+    if client is not None and server_name is None:
+        raise InputError("refresh client requires a single server")
+    servers = config.servers if server_name is None else {
+        server_name: config.servers[server_name]
+    }
+    discovered: dict[str, list[dict[str, Any]]] = {}
     errors: list[dict[str, str]] = []
-    successful_servers = 0
-    for server_name, definition in config.servers.items():
+    for name, definition in servers.items():
         try:
-            entries.extend(_discover_server(config, server_name, definition))
-            successful_servers += 1
+            discovered[name] = _discover_server(
+                config, name, definition, client=client, deadline=deadline
+            )
         except (RouterError, OSError) as exc:
-            error = {"server": server_name, "error": type(exc).__name__}
+            error = {"server": name, "error": type(exc).__name__}
             if isinstance(exc, RouterError):
                 error["code"] = exc.code
             elif exc.errno is not None:
                 error["code"] = f"os_error_{exc.errno}"
             errors.append(error)
-            entries.extend(_stale_server_entries(old, server_name, definition))
+    lock_deadline = deadline if deadline is not None else (
+        time.monotonic() + config.call_timeout_seconds
+    )
+    try:
+        with _refresh_lock(config, lock_deadline):
+            return _write_refreshed_catalog(config, server_name, servers, discovered, errors)
+    except OSError as exc:
+        raise ExecutionError("could not lock or write catalog") from exc
+
+
+def _write_refreshed_catalog(
+    config: Config,
+    server_name: str | None,
+    servers: dict[str, dict[str, Any]],
+    discovered: dict[str, list[dict[str, Any]]],
+    errors: list[dict[str, str]],
+) -> dict[str, Any]:
+    old: dict[str, Any] = {"capabilities": []}
+    if config.catalog_path.exists():
+        try:
+            old, _ = load_catalog(config)
+        except VerificationError:
+            if server_name is not None:
+                raise
+            old = {"capabilities": []}
+    if server_name is None:
+        entries = _skill_entries(config)
+    else:
+        entries = [
+            item for item in old["capabilities"]
+            if not (
+                item.get("kind") == CapabilityKind.MCP_TOOL
+                and item.get("source") == server_name
+            )
+        ]
+    for name, definition in servers.items():
+        if name in discovered:
+            entries.extend(discovered[name])
+        else:
+            entries.extend(_stale_server_entries(old, name, definition))
     ids: set[str] = set()
     for item in entries:
         if item["id"] in ids:
             raise VerificationError("refresh produced a duplicate capability ID")
         ids.add(item["id"])
-    if config.servers and successful_servers == 0 and not any(
+    if servers and not discovered and not any(
         item.get("kind") == CapabilityKind.MCP_TOOL and item.get("stale")
         for item in entries
     ):

@@ -849,23 +849,23 @@ class ValidationAndPolicyTests(RouterTestCase):
 
         self.assertEqual(read_json_lines(self.workspace.state / "starts.jsonl"), [])
 
-    def test_call_denies_changed_runtime_schema(self) -> None:
+    def test_call_refreshes_changed_runtime_schema(self) -> None:
         self.workspace.refresh()
         (self.workspace.state / "fixture.schema-mode").write_text("changed", encoding="utf-8")
         self.workspace.clear_fixture_observation()
         with self.workspace.session() as session:
             session.initialize()
-            session.assert_tool_error(
-                self,
+            response, document = session.tool_document(
                 {
                     "action": "call",
                     "capability_id": "fixture.search_messages",
                     "arguments": {"query": "safe"},
                 },
-                "refresh_required",
             )
+            self.assertNotIn("isError", response["result"], document)
+            self.assertIn("matches:safe", str(document))
 
-        self.assertEqual(read_json_lines(self.workspace.state / "calls.jsonl"), [])
+        self.assertEqual(len(read_json_lines(self.workspace.state / "calls.jsonl")), 1)
         self.assertEqual(len(read_json_lines(self.workspace.state / "starts.jsonl")), 1)
 
     def test_call_denies_changed_runtime_task_support_before_call(self) -> None:
