@@ -94,6 +94,18 @@ The MCP server exposes one tool. Its common actions are:
 
 Search for one need per call. Use a result limit from 1 through 5.
 
+If a tool schema changes or a downstream tool disappears, `call` refreshes that
+server's catalog once. It checks access policy and arguments again before it
+invokes the tool. Incompatible arguments return `schema_validation_failed` with
+the new schema in `error.details.input_schema`. If the schema exceeds the output
+limit, `error.details.artifact_path` points to the full error document, with its
+digest in `error.details.sha256`. A tool that remains missing or
+changes again returns `refresh_required`. Automatic refreshes create
+`auto_refresh` audit entries when audit logging is enabled.
+
+Running sessions reload catalog file changes before the next capability request.
+An external catalog refresh does not require a server restart.
+
 The reusable agent skill is in
 [skills/capability-router/SKILL.md](skills/capability-router/SKILL.md).
 

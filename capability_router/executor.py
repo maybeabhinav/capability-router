@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 import uuid
 
-from .catalog import search, tool_supported
+from . import PRODUCT_NAME
+from .catalog import load_catalog, refresh_catalog, search, tool_supported
 from .config import AccessLevel, Config, RouterMode
 from .downstream import HttpClient, StdioClient, downstream_client
 from .errors import ErrorCode, InputError, RouterError
 from .protocol import (
     ACTION_FIELDS,
+    AuditAction,
+    AuditOutcome,
     CapabilityAvailability,
     CapabilityKind,
     MAX_SEARCH_QUERY_LENGTH,
@@ -23,6 +27,22 @@ from .protocol import (
 )
 from .schema import validate
 from .util import atomic_write, canonical_bytes, safe_component, sha256_bytes, utc_now
+
+
+_audit_warning_lock = threading.Lock()
+_audit_warning_emitted = False
+
+
+def warn_audit_failure() -> None:
+    global _audit_warning_emitted
+    with _audit_warning_lock:
+        if _audit_warning_emitted:
+            return
+        _audit_warning_emitted = True
+    try:
+        print(f"{PRODUCT_NAME}: audit log write failed", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 def _find(catalog: dict[str, Any], capability_id: str) -> dict[str, Any]:
@@ -148,14 +168,45 @@ class Executor:
         *,
         run_id: str,
         audit_path: Path | None,
+        capability_filter: Callable[[dict[str, Any]], bool] | None = None,
     ) -> None:
         self.config = config
-        self.catalog = catalog
+        self.capability_filter = capability_filter
+        self.catalog = self._filter_catalog(catalog)
+        self.catalog_signature: tuple[int, ...] | None = None
+        self.catalog_lock = threading.Lock()
         self.run_id = run_id
         self.audit_path = audit_path
         self.active_clients: set[StdioClient | HttpClient] = set()
         self.active_clients_lock = threading.Lock()
         self.shutting_down = threading.Event()
+
+    def _filter_catalog(self, catalog: dict[str, Any]) -> dict[str, Any]:
+        if self.capability_filter is None:
+            return catalog
+        return {
+            **catalog,
+            "capabilities": [
+                item for item in catalog["capabilities"] if self.capability_filter(item)
+            ],
+        }
+
+    def reload_catalog(self) -> None:
+        with self.catalog_lock:
+            try:
+                stat = self.config.catalog_path.stat()
+                signature = (
+                    stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+                )
+            except OSError:
+                signature = None
+            if signature is not None and signature == self.catalog_signature:
+                return
+            catalog, _ = load_catalog(self.config)
+            self.catalog = self._filter_catalog(catalog)
+            # Use the signature from before the read so a concurrent replacement
+            # always causes another reload on the next request.
+            self.catalog_signature = signature
 
     def close_active_clients(self) -> None:
         self.shutting_down.set()
@@ -229,6 +280,7 @@ class Executor:
                     pass
 
     def execute(self, raw: Any) -> dict[str, Any]:
+        self.reload_catalog()
         arguments = validate_action(raw)
         action = arguments["action"]
         handlers = {
@@ -314,8 +366,7 @@ class Executor:
             ) from exc
         return {"capability_id": item["id"], "untrusted": True, "body": body}
 
-    def _call(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        item = _find(self.catalog, arguments["capability_id"])
+    def _check_call_policy(self, item: dict[str, Any]) -> str:
         if item.get("kind") != CapabilityKind.MCP_TOOL:
             raise InputError("call requires an MCP tool capability")
         if item.get("availability") != CapabilityAvailability.AVAILABLE:
@@ -344,23 +395,94 @@ class Executor:
                 ErrorCode.REFRESH_REQUIRED,
                 "capability access changed after refresh",
             )
-        deadline = time.monotonic() + self.config.call_timeout_seconds
+        return server_name
+
+    def _validate_call_schema(
+        self,
+        item: dict[str, Any],
+        arguments: dict[str, Any],
+        deadline: float,
+        *,
+        include_schema: bool = False,
+    ) -> None:
         validation_errors = validate(
             item["input_schema"], arguments["arguments"], _deadline=deadline
         )
         if validation_errors:
+            details: dict[str, Any] = {"errors": validation_errors[:8]}
+            if include_schema:
+                details["input_schema"] = item["input_schema"]
             raise RouterError(
                 ErrorCode.SCHEMA_VALIDATION_FAILED,
                 "arguments do not match the capability schema",
-                {"errors": validation_errors[:8]},
+                details,
             )
+
+    def _auto_refresh(
+        self,
+        item: dict[str, Any],
+        server_name: str,
+        client: StdioClient | HttpClient,
+        deadline: float,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        code = None
+        try:
+            result = refresh_catalog(
+                self.config, server_name=server_name, client=client, deadline=deadline
+            )
+            self.reload_catalog()
+            if result["errors"]:
+                raise RouterError(ErrorCode.REFRESH_REQUIRED, "automatic catalog refresh failed")
+        except RouterError as exc:
+            code = exc.code
+            raise
+        finally:
+            try:
+                self.audit(
+                    AuditAction.AUTO_REFRESH,
+                    AuditOutcome.ERROR if code else AuditOutcome.ALLOWED,
+                    capability_id=item["id"],
+                    code=code,
+                    latency_seconds=time.monotonic() - started,
+                )
+            except (OSError, ValueError):
+                warn_audit_failure()
+        try:
+            return _find(self.catalog, item["id"])
+        except RouterError as exc:
+            if exc.code != ErrorCode.NOT_FOUND:
+                raise
+            raise RouterError(
+                ErrorCode.REFRESH_REQUIRED,
+                "capability is missing after automatic refresh",
+            ) from exc
+
+    def _runtime_tool(
+        self, client: StdioClient | HttpClient, item: dict[str, Any], deadline: float
+    ) -> dict[str, Any] | None:
+        tools = client.list_tools(deadline=deadline, wanted=item["name"])
+        return next((tool for tool in tools if tool.get("name") == item["name"]), None)
+
+    def _call(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        item = _find(self.catalog, arguments["capability_id"])
+        server_name = self._check_call_policy(item)
+        deadline = time.monotonic() + self.config.call_timeout_seconds
+        self._validate_call_schema(item, arguments, deadline)
         client = downstream_client(self.config, server_name)
         try:
             client.__enter__()
             self._register_client(client)
             client.initialize(deadline=deadline)
-            tools = client.list_tools(deadline=deadline, wanted=item["name"])
-            runtime = next((tool for tool in tools if tool.get("name") == item["name"]), None)
+            runtime = self._runtime_tool(client, item, deadline)
+            if runtime is None or (
+                sha256_bytes(canonical_bytes(runtime.get("inputSchema")))
+                != item["schema_sha256"]
+            ):
+                item = self._auto_refresh(item, server_name, client, deadline)
+                self._check_call_policy(item)
+                self._validate_call_schema(item, arguments, deadline, include_schema=True)
+                runtime = self._runtime_tool(client, item, deadline)
             if runtime is None:
                 raise RouterError(
                     ErrorCode.REFRESH_REQUIRED,

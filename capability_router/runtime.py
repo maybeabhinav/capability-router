@@ -43,19 +43,6 @@ CONTEXT_ACTIONS = frozenset(
 )
 
 
-def _filtered_catalog(
-    config: Config,
-    view: ContextView,
-) -> dict[str, Any]:
-    catalog, _ = load_catalog(config)
-    capabilities = [
-        item
-        for item in catalog["capabilities"]
-        if explain_availability(view, item)[0]
-    ]
-    return {**catalog, "capabilities": capabilities}
-
-
 class ContextRuntime:
     """Own the active executor for one client session."""
 
@@ -91,13 +78,14 @@ class ContextRuntime:
             except ValueError as error:
                 raise InputError(str(error)) from error
             config = replace(config, environment_overrides=environment)
-        catalog = _filtered_catalog(config, view)
+        catalog, _ = load_catalog(config)
         self.registry_revision = registry["revision"]
         return Executor(
             config,
             catalog,
             run_id=self.run_id,
             audit_path=self.audit_path,
+            capability_filter=lambda item: explain_availability(view, item)[0],
         )
 
     @property
@@ -135,6 +123,7 @@ class ContextRuntime:
 
     def _current(self, arguments: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
+            self.executor.reload_catalog()
             return {
                 "context": self.context,
                 "session": self.session,

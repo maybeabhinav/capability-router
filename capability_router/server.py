@@ -15,7 +15,7 @@ from . import PRODUCT_NAME, __version__
 from .catalog import load_catalog
 from .config import Config
 from .errors import ErrorCode, InputError, RouterError
-from .executor import Executor
+from .executor import Executor, warn_audit_failure
 from .contexts import RegistryStore
 from .runtime import ContextRuntime
 from .protocol import (
@@ -132,8 +132,6 @@ class Server:
         self.shutdown_event = threading.Event()
         self.shutdown_signal_received = False
         self.shutdown_signal_enabled = False
-        self.audit_warning_lock = threading.Lock()
-        self.audit_warning_emitted = False
         self.output: BinaryIO = sys.stdout.buffer
 
     def _output_failed(self) -> None:
@@ -419,7 +417,12 @@ class Server:
         action, audit_action, capability_id = self._tool_audit_context(raw_arguments)
         started = time.monotonic()
         try:
-            document = self.executor.execute(raw_arguments)
+            try:
+                document = self.executor.execute(raw_arguments)
+            finally:
+                # Retain removed IDs and recognize IDs added during reload.
+                _, _, reloaded_id = self._tool_audit_context(raw_arguments)
+                capability_id = capability_id or reloaded_id
         except Exception as caught:
             error = (
                 caught
@@ -447,17 +450,7 @@ class Server:
         try:
             self.executor.audit(*args, **kwargs)
         except (OSError, ValueError):
-            self._warn_audit_failure()
-
-    def _warn_audit_failure(self) -> None:
-        with self.audit_warning_lock:
-            if self.audit_warning_emitted:
-                return
-            self.audit_warning_emitted = True
-        try:
-            print(f"{PRODUCT_NAME}: audit log write failed", file=sys.stderr, flush=True)
-        except (OSError, ValueError):
-            pass
+            warn_audit_failure()
 
     def _bounded_result(
         self, document: dict[str, Any], *, is_error: bool = False
@@ -527,6 +520,20 @@ class Server:
                 "details": {"truncated": True},
             }
         }
+        if (
+            error.get("code") == ErrorCode.SCHEMA_VALIDATION_FAILED
+            and "input_schema" in error.get("details", {})
+        ):
+            try:
+                artifact = self.executor.store_artifact(document)
+            except (OSError, ValueError):
+                pass
+            else:
+                compact["error"]["details"].update(
+                    artifact_path=artifact["artifact_path"],
+                    sha256=artifact["sha256"],
+                )
+                return self._bounded_error_result(compact)
         return {
             "isError": True,
             "content": [{"type": "text", "text": canonical_bytes(compact).decode("utf-8")}],

@@ -69,6 +69,43 @@ class ContextRuntimeTests(RouterTestCase):
             raise AssertionError(completed.stdout + completed.stderr)
         return completed
 
+    def test_catalog_reloads_and_auto_refresh_keep_context_assignments(self) -> None:
+        config = json.loads(self.workspace.config_path.read_bytes())
+        config["call_timeout_seconds"] = 3
+        self.workspace.config_path.write_text(json.dumps(config))
+        self._context_cli("use", "personal", "--session", "agent-one")
+        session = McpSession(
+            self.workspace,
+            run_id="context-refresh",
+            serve_arguments=["--registry", str(self.registry), "--session", "agent-one"],
+        )
+        try:
+            session.start()
+            session.initialize()
+            session.tool_document({"action": "status"})
+            for schema_mode in ("changed", "incompatible"):
+                (self.workspace.state / "fixture.schema-mode").write_text(schema_mode)
+                if schema_mode == "changed":
+                    self.workspace.refresh()
+                response, document = session.tool_document({
+                    "action": "call", "capability_id": "fixture.search_messages",
+                    "arguments": {"query": "ok"},
+                })
+                self.assertNotIn("isError", response["result"], document)
+                session.assert_tool_error(self, {
+                    "action": "call", "capability_id": "fixture.paginated_lookup",
+                    "arguments": {"id": "hidden"},
+                }, "not_found")
+                _, current = session.tool_document({"action": "context_current"})
+                self.assertEqual(current["capability_count"], 3)
+        finally:
+            session.close()
+        refreshes = [entry for entry in read_json_lines(self.workspace.audit_path)
+                     if entry["action"] == "auto_refresh"]
+        self.assertEqual(len(refreshes), 1)
+        self.assertTrue(all(entry["tool"] == "search_messages"
+                            for entry in read_json_lines(self.workspace.state / "calls.jsonl")))
+
     def test_agent_moves_and_undoes_capability_assignment(self) -> None:
         session = McpSession(
             self.workspace,

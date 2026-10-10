@@ -37,6 +37,7 @@ class CapabilityAvailability(WireValue):
 
 class AuditAction(WireValue):
     INVALID = "invalid"
+    AUTO_REFRESH = "auto_refresh"
 
 
 class AuditOutcome(WireValue):

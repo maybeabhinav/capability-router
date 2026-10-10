@@ -165,6 +165,7 @@ class Workspace:
         for name in (
             "starts.jsonl",
             "calls.jsonl",
+            "lists.jsonl",
             "process.json",
             "hanging-pids.json",
             "stubborn-pids.json",
